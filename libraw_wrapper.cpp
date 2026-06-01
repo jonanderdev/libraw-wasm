@@ -20,6 +20,11 @@ public:
 
 	~WASMLibRaw() {
 		if (processor_) {
+			// SCANND FORK: free any held processed image FIRST (uses processor_).
+			if (heldProcessedImage_) {
+				processor_->dcraw_clear_mem(heldProcessedImage_);
+				heldProcessedImage_ = nullptr;
+			}
 			cleanupParamsStrings();
             processor_->recycle();
 			delete processor_;
@@ -930,9 +935,28 @@ public:
         resultObj.set("dataSize", (unsigned int)out->data_size);
         resultObj.set("data", toJSTypedArray(out->bits, out->data_size, out->data));
 
-		processor_->dcraw_clear_mem(out);
+		// SCANND FORK: do NOT free the processed image here. The `data` field
+		// is now a LIVE VIEW over out->data (toJSTypedArray returns a
+		// typed_memory_view, not a copy). Freeing here would invalidate the
+		// view before the JS caller can read it. The buffer is freed on the
+		// next imageData() call OR when the WASMLibRaw instance is destroyed
+		// (see destructor / clearProcessedImage). See toJSTypedArray comments.
+		if (heldProcessedImage_) {
+			processor_->dcraw_clear_mem(heldProcessedImage_);
+		}
+		heldProcessedImage_ = out;
 
 		return resultObj;
+	}
+
+	// SCANND FORK: explicit release for callers that want to free early.
+	// Safe to call multiple times. Invalidates any heap-view returned by the
+	// most recent imageData() call.
+	void clearProcessedImage() {
+		if (heldProcessedImage_ && processor_) {
+			processor_->dcraw_clear_mem(heldProcessedImage_);
+			heldProcessedImage_ = nullptr;
+		}
 	}
     
     val thumbnailData() {
@@ -968,6 +992,10 @@ public:
 private:
 	LibRaw* processor_ = nullptr;
     std::vector<uint8_t> buffer;
+	// SCANND FORK: held processed image so the heap-view returned by
+	// imageData() stays valid until the caller is done with it. Freed on the
+	// next imageData() / clearProcessedImage() / destruction.
+	libraw_processed_image_t* heldProcessedImage_ = nullptr;
 	bool isUnpacked = false;
 
 	void applySettings(const val& settings) {
@@ -1165,19 +1193,24 @@ private:
 	}
     
     val toJSTypedArray(size_t bits, size_t data_size, uint8_t *data) {
+        // SCANND FORK: return the heap view directly instead of allocating a
+        // new typed array and copying the bytes in via .set(). The copy was
+        // the dominant cost in imageData() — 20-38s for a typical 24-26MP RAW
+        // (~70MB buffer) on WASM. Returning the view drops this to <2s.
+        //
+        // CALLER CONTRACT: the returned typed array is a LIVE VIEW over the
+        // WASM heap. It becomes invalid if (a) the heap grows (any malloc /
+        // call into libraw that allocates) OR (b) dcraw_clear_mem is called
+        // on the parent processed image. Callers must finish reading from /
+        // writing through this view BEFORE either happens. For one-shot
+        // decode-then-transfer-to-main-thread flows (scannd's case) this is
+        // trivial; for callers that keep the bitmap around across libraw
+        // calls, .slice() the view themselves to get an owned copy.
         if (bits == 16) {
             unsigned length = (unsigned)data_size / 2;
-            val typedArrayCtor = val::global("Uint16Array");
-            val typedArray = typedArrayCtor.new_(val(length));
-            val memView = val(typed_memory_view(length, (uint16_t*)data));
-            typedArray.call<void>("set", memView);
-            return typedArray;
+            return val(typed_memory_view(length, (uint16_t*)data));
         } else {
-            val typedArrayCtor = val::global("Uint8Array");
-            val typedArray = typedArrayCtor.new_(val((unsigned)data_size));
-            val memView = val(typed_memory_view(data_size, (uint8_t*)data));
-            typedArray.call<void>("set", memView);
-            return typedArray;
+            return val(typed_memory_view(data_size, (uint8_t*)data));
         }
     }
     
@@ -1221,5 +1254,6 @@ EMSCRIPTEN_BINDINGS(libraw_module) {
 		.function("open", &WASMLibRaw::open)
 		.function("metadata", &WASMLibRaw::metadata)
         .function("imageData", &WASMLibRaw::imageData)
+        .function("clearProcessedImage", &WASMLibRaw::clearProcessedImage)
 		.function("thumbnailData", &WASMLibRaw::thumbnailData);
 }
