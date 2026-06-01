@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="UTF-8" />
+	<title>LibRaw Direct-Mode Test (SCANND FORK)</title>
+	<style>
+		body { font-family: system-ui, sans-serif; max-width: 1200px; margin: 1rem auto; padding: 0 1rem; }
+		canvas { display: block; max-width: 100%; height: auto; margin-top: 1rem; border: 1px solid #ccc; background: #222; }
+		pre { background: #f4f4f4; padding: 0.75rem; border-radius: 4px; overflow-x: auto; }
+		.note { color: #666; font-size: 0.9rem; }
+	</style>
+</head>
+<body>
+	<h1>LibRaw Direct-Mode Test</h1>
+	<p>This page loads libraw via <code>./dist/direct.js</code> — no inner Web Worker, WASM hosted in this page directly. Decoded pixels are rendered to the canvas below as a sanity check.</p>
+	<p class="note">The rendered preview applies a quick gamma curve only (raw libraw output is dark/linear-ish). It won't look like a finished JPEG — scannd's pipeline applies its own tone curve. The point is to confirm the bytes are valid image data, not garbage.</p>
+	<input type="file" id="file" accept=".cr2,.cr3,.nef,.arw,.dng,.raf,.raw,.rw2,.orf" />
+	<pre id="output">Select a RAW file. Timings + render appear below.</pre>
+	<canvas id="preview" width="800" height="600"></canvas>
+
+	<script type="module">
+		import { createDirectLibRaw } from './dist/direct.js';
+
+		const fileInput = document.getElementById('file');
+		const output = document.getElementById('output');
+		const canvas = document.getElementById('preview');
+		const ctx = canvas.getContext('2d');
+
+		// Display cap: downscale to fit ~1200px long edge so the canvas stays
+		// sensible on screen. The libraw output is multi-megapixel.
+		const DISPLAY_LONG_EDGE = 1200;
+
+		// Quick 16-bit linear → 8-bit gamma-corrected. This is NOT scannd's
+		// tone curve — it's just a one-liner gamma 2.2 to make the dark linear
+		// decode look roughly visible. If we just used the high byte (>>8)
+		// the result would be very dark and flat.
+		const GAMMA = 1 / 2.2;
+		const gammaLut = new Uint8Array(65536);
+		for (let i = 0; i < 65536; i++) {
+			gammaLut[i] = Math.min(255, Math.round(Math.pow(i / 65535, GAMMA) * 255));
+		}
+
+		// Convert 16-bit RGB (interleaved) → 8-bit RGBA, downscaling by an
+		// integer step on the way. The downscale is nearest-neighbour (we pick
+		// every Nth pixel) which is fine for a sanity-check view. We do this
+		// BEFORE clearProcessedImage so the heap view is still valid.
+		function renderToCanvas(u16, srcW, srcH) {
+			const step = Math.max(1, Math.floor(Math.max(srcW, srcH) / DISPLAY_LONG_EDGE));
+			const dstW = Math.floor(srcW / step);
+			const dstH = Math.floor(srcH / step);
+			canvas.width = dstW;
+			canvas.height = dstH;
+			const out = new Uint8ClampedArray(dstW * dstH * 4);
+			let o = 0;
+			for (let y = 0; y < dstH; y++) {
+				const sy = y * step;
+				const rowStart = sy * srcW * 3;
+				for (let x = 0; x < dstW; x++) {
+					const sx = x * step;
+					const i = rowStart + sx * 3;
+					out[o] = gammaLut[u16[i]];
+					out[o + 1] = gammaLut[u16[i + 1]];
+					out[o + 2] = gammaLut[u16[i + 2]];
+					out[o + 3] = 255;
+					o += 4;
+				}
+			}
+			ctx.putImageData(new ImageData(out, dstW, dstH), 0, 0);
+			return { dstW, dstH, step };
+		}
+
+		fileInput.addEventListener('change', async (event) => {
+			const file = event.target.files[0];
+			if (!file) return;
+
+			try {
+				const t0 = performance.now();
+				const arrayBuffer = await file.arrayBuffer();
+				const t1 = performance.now();
+				console.log(`[direct] file read: ${(t1 - t0).toFixed(0)}ms`);
+
+				const raw = await createDirectLibRaw();
+				const t2 = performance.now();
+				console.log(`[direct] module load: ${(t2 - t1).toFixed(0)}ms`);
+
+				raw.open(new Uint8Array(arrayBuffer), {
+					useCameraWb: true,
+					useCameraMatrix: 3,
+					outputColor: 1,
+					noAutoBright: true,
+					highlight: 1,
+					outputBps: 16,
+					userFlip: -1,
+					fbddNoiserd: 2,
+					threshold: 0,
+				});
+				const t3 = performance.now();
+				console.log(`[direct] open + decode: ${(t3 - t2).toFixed(0)}ms`);
+
+				const img = raw.imageData();
+				const t4 = performance.now();
+				console.log(`[direct] imageData() : ${(t4 - t3).toFixed(0)}ms`);
+				console.log(`[direct] image: ${img.width}x${img.height} bits=${img.bits} colors=${img.colors} dataSize=${img.dataSize}`);
+				console.log(`[direct] buffer byteLength: ${img.data.buffer.byteLength} (== dataSize? ${img.data.buffer.byteLength === img.dataSize})`);
+				console.log(`[direct] sample pixels (first 12 u16):`, Array.from(img.data.subarray(0, 12)));
+
+				// Render BEFORE clearProcessedImage — the heap view is still valid here.
+				const render = renderToCanvas(img.data, img.width, img.height);
+				const t5 = performance.now();
+				console.log(`[direct] render to canvas (downscale ${render.step}× → ${render.dstW}x${render.dstH}): ${(t5 - t4).toFixed(0)}ms`);
+
+				raw.clearProcessedImage();
+				const t6 = performance.now();
+				console.log(`[direct] clearProcessedImage: ${(t6 - t5).toFixed(0)}ms`);
+
+				console.log(`[direct] TOTAL: ${(t6 - t1).toFixed(0)}ms`);
+
+				output.innerText = JSON.stringify({
+					file: file.name,
+					decoded: `${img.width}x${img.height} (${img.bits}-bit ${img.colors}-channel)`,
+					displayed: `${render.dstW}x${render.dstH} (downscaled ${render.step}×)`,
+					heapViewConfirmed: img.data.buffer.byteLength !== img.dataSize,
+					timings: {
+						moduleLoad_ms: +(t2 - t1).toFixed(0),
+						openAndDecode_ms: +(t3 - t2).toFixed(0),
+						imageData_ms: +(t4 - t3).toFixed(0),
+						renderToCanvas_ms: +(t5 - t4).toFixed(0),
+						clearProcessed_ms: +(t6 - t5).toFixed(0),
+						total_ms: +(t6 - t1).toFixed(0),
+					},
+				}, null, 2);
+			} catch (err) {
+				console.error('[direct] error:', err);
+				output.innerText = `ERROR: ${err.message ?? err}`;
+			}
+		});
+	</script>
+</body>
+</html>

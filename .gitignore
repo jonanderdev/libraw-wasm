@@ -2,3 +2,8 @@ LibRawSource/
 lcms2/
 .DS_Store
 node_modules/
+
+# Local-only scratchpad backups (kept around so a broken build can be
+# reverted without re-cloning). Not for the repo.
+*.upstream
+dist.upstream/
