@@ -1,10 +1,20 @@
 {
 	"name": "libraw-wasm",
-	"version": "1.2.0",
-	"description": "LibRaw WASM bindings to be able to use it in the browser.",
+	"version": "1.2.0-scannd.1",
+	"description": "LibRaw WASM bindings to be able to use it in the browser. (scannd fork — adds direct-mode entry that hosts WASM in the caller's worker for zero-copy heap-view access; see direct.js.)",
 	"main": "dist/index.js",
 	"type": "module",
 	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./direct": {
+			"types": "./dist/direct.d.ts",
+			"default": "./dist/direct.js"
+		}
+	},
 	"directories": {
 		"lib": "lib"
 	},
