@@ -93,7 +93,25 @@ export interface ThumbnailImageData {
 declare class LibRaw {
   open(data: Uint8Array, options?: LibRawOptions): Promise<void>;
   metadata(fullOutput?: boolean): Promise<unknown>;
+  /**
+   * SCANND FORK: the `data` field is now a LIVE VIEW into the WASM heap, not
+   * an owned typed array. Drops 20-38s of memcpy on a typical 24-26MP RAW.
+   *
+   * Callers MUST finish reading from / writing through `data` before:
+   *   - calling clearProcessedImage(), or
+   *   - calling imageData() again (which auto-frees the previous buffer), or
+   *   - calling any LibRaw method that could grow the WASM heap.
+   *
+   * For one-shot decode-then-transfer-to-main-thread flows this is trivial.
+   * For longer-lived bitmaps, call `.slice()` on `data` to make an owned copy.
+   */
   imageData(): Promise<RawImageData>;
+  /**
+   * SCANND FORK: explicitly free the processed image buffer held alive for
+   * the most recent imageData() heap view. Safe to call multiple times.
+   * Invalidates any view returned by the most recent imageData() call.
+   */
+  clearProcessedImage(): Promise<void>;
   thumbnailData(): Promise<ThumbnailImageData | undefined>;
 }
 export default LibRaw;
