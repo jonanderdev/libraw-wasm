@@ -45,9 +45,17 @@ let cachedModulePromise = null;
  * promise avoids paying the WASM compilation/instantiation cost more than
  * once when multiple createDirectLibRaw() calls happen in the same worker.
  */
+// SCANND FORK: lower INITIAL_MEMORY from the compiled 256MB baseline (see
+// worker.js for the full rationale). The Emscripten glue reads
+// Module["INITIAL_MEMORY"] before building the heap, so this overrides it with
+// no recompile; ALLOW_MEMORY_GROWTH=1 lets the heap grow on demand for the
+// actual decode. Applied here too so the direct (desktop) path matches the
+// default-class (iOS) path.
+const LIBRAW_INITIAL_MEMORY = 48 * 1024 * 1024;
+
 function loadModule() {
 	if (!cachedModulePromise) {
-		cachedModulePromise = LibRawModule();
+		cachedModulePromise = LibRawModule({ INITIAL_MEMORY: LIBRAW_INITIAL_MEMORY });
 	}
 	return cachedModulePromise;
 }
