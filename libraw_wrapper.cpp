@@ -924,6 +924,17 @@ public:
 			return val::undefined();
 		}
 
+		// dcraw_make_mem_image() copied the developed pixels into `out` (an
+		// independent buffer). LibRaw's internal working set is now dead weight but
+		// lives until recycle()/destruction, stacking under the caller's post-decode
+		// passes and OOM-killing memory-constrained tabs. Free it now. free_image()
+		// drops imgdata.image (~190MB @24MP); recycle_datastream() drops the input
+		// bytes. Do NOT call recycle() — metadata (cam_mul/dims) must survive for a
+		// later metadata() call. `out` is independent, so the returned heap-view
+		// stays valid.
+		processor_->free_image();
+		processor_->recycle_datastream();
+
 		// Prepare a JS object to hold all the result fields
 		val resultObj = val::object();
 
