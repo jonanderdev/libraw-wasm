@@ -913,6 +913,17 @@ public:
 			if (ret != LIBRAW_SUCCESS) {
 				throw std::runtime_error("LibRaw: dcraw_process() failed with code " + std::to_string(ret));
 			}
+
+			// Input bytes are fully consumed once dcraw_process() has built
+			// imgdata.image. Drop them BEFORE make_mem_image() allocates the output
+			// copy, so the raw datastream never coexists with image+output at the
+			// peak. Freeing AFTER the copy is too late — the WASM heap high-water is
+			// already set and never shrinks. recycle_datastream() drops LibRaw's I/O
+			// stream; clearing `buffer` releases our copy of the file bytes it pointed
+			// at (safe to clear only after the datastream that referenced it is gone).
+			processor_->recycle_datastream();
+			buffer.clear();
+			buffer.shrink_to_fit();
 		}
 
 		// Make a processed image in memory
@@ -923,6 +934,15 @@ public:
 			// we return undefined or throw an error
 			return val::undefined();
 		}
+
+		// imgdata.image (~190MB @24MP) is dead weight once make_mem_image has copied
+		// the pixels into the independent `out` buffer. Free it. NOTE: this is
+		// RSS-neutral on engines that don't decommit (WASM can't shrink) — the real
+		// peak win is the pre-copy datastream free above — but it's cheap insurance
+		// for engines that DO madvise large frees, and harmless otherwise. We do NOT
+		// recycle() — idata/color/sizes (cam_mul, dims) must survive a later
+		// metadata() call. `out` is independent, so the returned heap-view stays valid.
+		processor_->free_image();
 
 		// Prepare a JS object to hold all the result fields
 		val resultObj = val::object();
