@@ -21,10 +21,14 @@ public:
 	~WASMLibRaw() {
 		if (processor_) {
 			// SCANND FORK: free any held processed image FIRST (uses processor_).
-			if (heldProcessedImage_) {
+			// In the IN-PLACE develop path the live view was imgdata.image (NOT a
+			// malloc'd processed image) — do NOT dcraw_clear_mem it; recycle() below
+			// frees imgdata.image as part of LibRaw's normal teardown.
+			if (!inPlaceView_ && heldProcessedImage_) {
 				processor_->dcraw_clear_mem(heldProcessedImage_);
 				heldProcessedImage_ = nullptr;
 			}
+			inPlaceView_ = false;
 			cleanupParamsStrings();
             processor_->recycle();
 			delete processor_;
@@ -926,7 +930,52 @@ public:
 			buffer.shrink_to_fit();
 		}
 
-		// Make a processed image in memory
+		// Develop the RGB output. To avoid the ~142MB second buffer coexisting with
+		// imgdata.image (~189MB) — the iOS export Jetsam — write the RGB output IN PLACE
+		// into imgdata.image's OWN buffer when there's no rotation (flip==0): the 6-byte/px
+		// 16-bit-RGB write always trails the 8-byte/px read (copy_mem_image reads strictly
+		// row-sequential at flip==0), so we never clobber an unread pixel. Peak ~= 189MB.
+		// Rotated frames (flip!=0) scatter the reads → unsafe in place → use the normal path.
+		int mw, mh, mcolors, mbps;
+		processor_->get_mem_image_format(&mw, &mh, &mcolors, &mbps);
+		const int mstride = mw * (mbps / 8) * mcolors;
+		const size_t mdataSize = (size_t)mh * (size_t)mstride;
+		const int flip = processor_->imgdata.sizes.flip;
+
+		if (flip == 0) {
+			// IN-PLACE: copy_mem_image writes RGB into imgdata.image's buffer.
+			void* scan0 = (void*)processor_->imgdata.image;
+			int cret = processor_->copy_mem_image(scan0, mstride, 0);
+			if (cret != 0) {
+				throw std::runtime_error("LibRaw: copy_mem_image() failed code " + std::to_string(cret));
+			}
+
+			// The heap view points at imgdata.image. It must stay valid until the JS
+			// caller reads it, so we must NOT free_image() here. Free any PRIOR held
+			// malloc'd processed image (from an earlier flip!=0 imageData() call) and
+			// mark that the live view is now imgdata.image (NOT a malloc'd processed
+			// image). clearProcessedImage()/next-imageData()/destructor consult
+			// inPlaceView_ so they free via free_image()/recycle() and NEVER call
+			// dcraw_clear_mem on imgdata.image (which would be catastrophic).
+			if (heldProcessedImage_) {
+				processor_->dcraw_clear_mem(heldProcessedImage_);
+				heldProcessedImage_ = nullptr;
+			}
+			inPlaceView_ = true;
+
+			// Build the result viewing imgdata.image's buffer as the RGB output.
+			val resultObj = val::object();
+			resultObj.set("height", mh);
+			resultObj.set("width",  mw);
+			resultObj.set("colors", mcolors);
+			resultObj.set("bits",   mbps);
+			resultObj.set("dataSize", (unsigned int)mdataSize);
+			resultObj.set("data", toJSTypedArray(mbps, mdataSize, (uint8_t*)processor_->imgdata.image));
+			return resultObj;
+		}
+
+		// flip != 0: original path — separate `out` buffer (rotated frames scatter the
+		// reads so they can't develop in place).
 		libraw_processed_image_t* out = nullptr;
 		out = processor_->dcraw_make_mem_image();
 		if (!out) {
@@ -965,15 +1014,29 @@ public:
 			processor_->dcraw_clear_mem(heldProcessedImage_);
 		}
 		heldProcessedImage_ = out;
+		// This path's live view is a malloc'd processed image, not imgdata.image.
+		inPlaceView_ = false;
 
 		return resultObj;
 	}
 
 	// SCANND FORK: explicit release for callers that want to free early.
 	// Safe to call multiple times. Invalidates any heap-view returned by the
-	// most recent imageData() call.
+	// most recent imageData() call. The caller calling this is its "I'm done with
+	// the view" signal, so it's safe to release the underlying buffer here.
 	void clearProcessedImage() {
-		if (heldProcessedImage_ && processor_) {
+		if (!processor_) {
+			return;
+		}
+		if (inPlaceView_) {
+			// The live view was imgdata.image (in-place develop). It is owned by
+			// LibRaw — free it via free_image(), NEVER dcraw_clear_mem. metadata()
+			// reads idata/color/sizes which are untouched by free_image().
+			inPlaceView_ = false;
+			processor_->free_image();
+			return;
+		}
+		if (heldProcessedImage_) {
 			processor_->dcraw_clear_mem(heldProcessedImage_);
 			heldProcessedImage_ = nullptr;
 		}
@@ -1016,6 +1079,11 @@ private:
 	// imageData() stays valid until the caller is done with it. Freed on the
 	// next imageData() / clearProcessedImage() / destruction.
 	libraw_processed_image_t* heldProcessedImage_ = nullptr;
+	// SCANND FORK: true when the most recent imageData() developed IN PLACE into
+	// imgdata.image (flip==0 path) instead of allocating a separate processed
+	// image. In that case the live heap-view is imgdata.image, owned by LibRaw —
+	// it must be freed via free_image()/recycle(), NEVER dcraw_clear_mem.
+	bool inPlaceView_ = false;
 	bool isUnpacked = false;
 
 	void applySettings(const val& settings) {
